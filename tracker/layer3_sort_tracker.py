@@ -1,42 +1,34 @@
-import numpy as np
-from sort.sort import Sort  # you can vendor SORT or install a package
+from deep_sort_realtime.deepsort_tracker import DeepSort
 
 class SortTracker:
-    def __init__(self):
-        self.tracker = Sort(
-            max_age=30,
-            min_hits=3,
-            iou_threshold=0.3
-        )
+    def __init__(self, max_age=30, n_init=3):
+        # Initialize DeepSort tracker
+        self.tracker = DeepSort(max_age=max_age, n_init=n_init)
 
-    def update(self, detections):
+    def update(self, detections, frame=None):
         """
-        detections: list of dicts with bbox + confidence
-        Returns tracked objects with IDs
+        detections: list of dicts with keys ["bbox", "class", "confidence"]
+        frame: current frame for embedding generation (required by DeepSort)
         """
-        if len(detections) == 0:
-            dets = np.empty((0, 5))
-        else:
-            dets = np.array([
-                [
-                    d["bbox"][0],
-                    d["bbox"][1],
-                    d["bbox"][2],
-                    d["bbox"][3],
-                    d["confidence"]
-                ]
-                for d in detections if d["class"] == "person"
-            ])
+        dets = []
+        for d in detections:
+            x1, y1, x2, y2 = d["bbox"]
+            conf = d.get("confidence", 1.0)
+            dets.append(([x1, y1, x2, y2], conf, d["class"]))
 
-        tracks = self.tracker.update(dets)
+        if frame is None:
+            # DeepSort requires either embeddings or frame
+            raise ValueError("Frame must be provided for tracking")
+
+        tracks = self.tracker.update_tracks(dets, frame=frame)
 
         results = []
         for t in tracks:
-            x1, y1, x2, y2, track_id = map(int, t)
+            if not t.is_confirmed():
+                continue
+            x1, y1, x2, y2 = t.to_ltrb()
             results.append({
-                "track_id": track_id,
-                "bbox": [x1, y1, x2, y2],
-                "class": "person"
+                "track_id": t.track_id,
+                "bbox": [int(x1), int(y1), int(x2), int(y2)]
             })
-
         return results
