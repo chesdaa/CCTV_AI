@@ -1,67 +1,95 @@
 import cv2
+import time
+
 from config.layer0_cameras import CAMERAS
 from ingest.layer1_frame_ingest import FrameIngestor
 from detector.layer2_yolo_detector import YOLODetector
 from tracker.layer3_sort_tracker import SortTracker
 from tracker.layer4_motion_tracker import MotionAnalyzer
 from tracker.layer5_behavior import BehaviorDecider
-# from tracker.layer6_telegram import TelegramNotifier  # Uncomment when ready
+from tracker.layer6_telegram import TelegramNotifier
+from config.telegram_config import BOT_TOKEN, CHAT_ID
 
+
+# ===================== TELEGRAM COOLDOWN =====================
+last_telegram_sent = {}  # (track_id, decision) -> timestamp
+
+
+def can_send(track_id, decision, cooldown):
+    now = time.time()
+    key = (track_id, decision)
+
+    if key not in last_telegram_sent:
+        last_telegram_sent[key] = now
+        return True
+
+    if now - last_telegram_sent[key] >= cooldown:
+        last_telegram_sent[key] = now
+        return True
+
+    return False
+
+
+# ===================== UTIL =====================
+def check_bbox_overlap(person_bbox, ppe_bbox):
+    px1, py1, px2, py2 = person_bbox
+    dx1, dy1, dx2, dy2 = ppe_bbox
+
+    cx = (dx1 + dx2) / 2
+    cy = (dy1 + dy2) / 2
+
+    return px1 <= cx <= px2 and py1 <= cy <= py2
+
+
+# ===================== MAIN =====================
 def main():
     cam = CAMERAS[0]
 
-    # --- Initialize layers ---
     ingestor = FrameIngestor(
         camera_id=cam["camera_id"],
         source=cam["source"],
         sample_rate=3
     )
 
-    detector = YOLODetector(classes=["person", "mask", "helmet"])
+    detector = YOLODetector(classes=["person"])
     tracker = SortTracker()
-    motion = MotionAnalyzer(frame_gaps=[1,5,10,15,20])
-    behavior_decider = BehaviorDecider(motion_threshold=50, loitering_frames=10)
-    # notifier = TelegramNotifier(BOT_TOKEN, CHAT_ID)  # Uncomment when ready
+    motion = MotionAnalyzer(frame_gaps=[1, 5, 10, 15, 20])
 
-    print("Pipeline L1→L5 started... Press ESC to quit")
+    behavior = BehaviorDecider(
+        warning_time=100,   # warning at 100s
+        alert_time=200      # alert at 200s
+    )
+
+    telegram = TelegramNotifier(BOT_TOKEN, CHAT_ID)
+
+    print("[INFO] CCTV pipeline started")
 
     for data in ingestor.read():
         frame = data["frame"]
         frame_id = data["frame_id"]
-        cam_id = data["camera_id"]
 
-        # --- Layer 2: Detection ---
         detections = detector.detect(frame)
+        persons = [d for d in detections if d["class"] == "person"]
 
-        # --- Layer 3: Tracking ---
-        tracks = tracker.update(detections)
+        tracks = tracker.update(persons, frame)
 
-        # --- Layer 4: Motion Analysis ---
         motion_info = motion.update(tracks, frame_id)
+        behavior_info = behavior.update(tracks, motion_info)
 
-        # --- Layer 5: Behavior Decision ---
-        behavior_info = behavior_decider.update(tracks, motion_info)
-
-        # --- Visualization: Bounding boxes + Behavior ---
         for t, b in zip(tracks, behavior_info):
-            x1, y1, x2, y2 = t["bbox"]
             track_id = t["track_id"]
             decision = b["decision"]
+            reason = b["reason"]
 
-            # Choose color based on decision
-            if decision == "Normal":
-                color = (255, 0, 0)  # Blue
-            elif decision == "Warning":
-                color = (0, 165, 255)  # Orange
+            x1, y1, x2, y2 = t["bbox"]
+
+            color = (255, 0, 0)
+            if decision == "Warning":
+                color = (0, 165, 255)
             elif decision == "Alert":
-                color = (0, 0, 255)  # Red
-            else:
-                color = (255, 255, 255)  # fallback white
+                color = (0, 0, 255)
 
-            # Draw bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Draw track ID + decision text above bbox
             cv2.putText(
                 frame,
                 f"ID {track_id} | {decision}",
@@ -72,34 +100,24 @@ def main():
                 2
             )
 
-        # Optional: show motion gaps for debugging
-        for m in motion_info:
-            track_id = m["track_id"]
-            gap1 = int(m["motion_gaps"][1])
-            cv2.putText(frame, f"G1:{gap1}", (10, 50 + 20*track_id),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            # -------- TELEGRAM LOGIC --------
+            if decision == "Alert":
+                if can_send(track_id, "Alert", cooldown=240):
+                    telegram.send_alert(frame, track_id, cam["camera_id"], decision, reason)
+                    print("[TELEGRAM] ALERT sent")
 
-        cv2.putText(frame, f"{cam_id} | Frame {frame_id}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            elif decision == "Warning":
+                if can_send(track_id, "Warning", cooldown=240):
+                    telegram.send_alert(frame, track_id, cam["camera_id"], decision, reason)
+                    print("[TELEGRAM] WARNING sent")
 
-        cv2.imshow("CCTV AI Pipeline L1-L5", frame)
-
-        # Optional: Layer 6 Telegram alert (commented for testing)
-        # for b in behavior_info:
-        #     if b["decision"] in ["Warning", "Alert"]:
-        #         track_id = b["track_id"]
-        #         bbox = next((t["bbox"] for t in tracks if t["track_id"]==track_id), None)
-        #         if bbox:
-        #             x1, y1, x2, y2 = bbox
-        #             crop = frame[y1:y2, x1:x2]
-        #             notifier.send_alert(crop, track_id, cam_id, b["decision"], b["reason"])
-
+        cv2.imshow("CCTV AI", frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
-    # --- Cleanup ---
     ingestor.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
